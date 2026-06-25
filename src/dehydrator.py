@@ -359,7 +359,10 @@ class Dehydrator:
         )
         if not response.choices:
             return ""
-        return response.choices[0].message.content or ""
+        choice = response.choices[0]
+        if getattr(choice, "finish_reason", None) == "length":
+            logger.warning("LLM output truncated (finish_reason=length), JSON may be incomplete")
+        return choice.message.content or ""
 
     async def _chat_gemini(
         self,
@@ -442,6 +445,30 @@ class Dehydrator:
         if cleaned.startswith("```"):
             cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
         return cleaned
+
+    @staticmethod
+    def _repair_truncated_json_array(raw: str) -> list[dict] | None:
+        """Try to recover complete objects from a truncated JSON array.
+
+        When deepseek hits token limit mid-output, we get something like:
+            [{"name":"a", ...}, {"name":"b", ...}, {"name":"c", "content":"trunc
+        This finds the last complete object boundary and parses what we can.
+        Returns None if recovery fails entirely.
+        """
+        s = raw.strip()
+        if not s.startswith("["):
+            return None
+        last = s.rfind("}")
+        if last < 0:
+            return None
+        candidate = s[: last + 1].rstrip().rstrip(",") + "]"
+        try:
+            items = json.loads(candidate)
+            if isinstance(items, list) and items:
+                return items
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return None
 
     @staticmethod
     def _clamp_va(
@@ -751,8 +778,11 @@ class Dehydrator:
             cleaned = self._strip_md_fence(raw)
             items = json.loads(cleaned)
         except (json.JSONDecodeError, IndexError, ValueError):
-            logger.warning(f"Diary digest JSON parse failed / JSON 解析失败: {raw[:_PARSE_ERR_PREVIEW]}")
-            return []
+            items = self._repair_truncated_json_array(cleaned)
+            if items is None:
+                logger.warning(f"Diary digest JSON parse failed / JSON 解析失败: {raw[:_PARSE_ERR_PREVIEW]}")
+                return []
+            logger.info(f"Recovered {len(items)} item(s) from truncated JSON")
 
         if not isinstance(items, list):
             return []
